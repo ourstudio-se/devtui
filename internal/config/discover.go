@@ -407,7 +407,7 @@ func discoverNPM(root string, opts NPMDiscoverConfig) (Group, error) {
 			StartCommand: "npm run " + chosen,
 		}
 		if _, err := os.Stat(filepath.Join(dir, "package-lock.json")); err == nil {
-			svc.InstallCommand = "npm install"
+			svc.InstallCommand = "npm ci"
 		}
 
 		g.Services = append(g.Services, svc)

@@ -257,7 +257,7 @@ func (m *Manager) StopDocker(services []*Service) tea.Cmd {
 	}
 }
 
-// Rebuild rebuilds the selected service (docker build / dotnet build / npm install).
+// Rebuild rebuilds the selected service (docker build / dotnet build / npm ci).
 func (m *Manager) Rebuild(svc *Service) tea.Cmd {
 	return func() tea.Msg {
 		wasRunning := svc.State == StateRunning || svc.State == StateStarting
