@@ -65,8 +65,13 @@ func SaveState(projectRoot string, sf *StateFile) error {
 	return os.Rename(tmp, statePath(projectRoot))
 }
 
+// saveCurrentState writes a fresh state-file snapshot of currently tracked
+// processes. Callers MUST NOT hold m.mu — the snapshot is taken under the
+// lock, but the disk write happens outside it so slow I/O can't stall other
+// goroutines waiting on the manager mutex.
 func (m *Manager) saveCurrentState() {
-	var entries []ServiceEntry
+	m.mu.Lock()
+	entries := make([]ServiceEntry, 0, len(m.processes))
 	for name, proc := range m.processes {
 		pid := proc.pid
 		pgid := proc.pgid
@@ -77,23 +82,8 @@ func (m *Manager) saveCurrentState() {
 		if pid == 0 {
 			continue
 		}
-		entry := ServiceEntry{
-			Name: name,
-			PID:  pid,
-			PGID: pgid,
-		}
-		entries = append(entries, entry)
+		entries = append(entries, ServiceEntry{Name: name, PID: pid, PGID: pgid})
 	}
+	m.mu.Unlock()
 	SaveState(m.projectRoot, &StateFile{Services: entries})
-}
-
-func (m *Manager) removeServiceFromState(name string) {
-	sf, _ := LoadState(m.projectRoot)
-	var filtered []ServiceEntry
-	for _, e := range sf.Services {
-		if e.Name != name {
-			filtered = append(filtered, e)
-		}
-	}
-	SaveState(m.projectRoot, &StateFile{Services: filtered})
 }

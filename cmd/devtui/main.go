@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/ourstudio-se/devtui/internal/config"
 	"github.com/ourstudio-se/devtui/internal/ui"
@@ -31,9 +33,23 @@ func main() {
 	model := ui.NewModel(cfg)
 
 	p := tea.NewProgram(model)
-
-	// Give the manager a reference to the program for sending messages
 	model.SetProgram(p)
+	mgr := model.Manager()
+
+	// Children are started with Setpgid:true; if the parent dies first they
+	// are reparented to PID 1 and survive as orphans. Bubbletea consumes
+	// ctrl+c as a key event in raw mode, so SIGINT here only fires when the
+	// signal comes from outside (kill, terminal close, shell exit).
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGINT)
+	go func() {
+		<-sigCh
+		mgr.StopAllProcesses()
+		p.Send(tea.Quit())
+	}()
+
+	// Belt-and-suspenders for any unexpected exit path (panic recovery etc.).
+	defer mgr.StopAllProcesses()
 
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

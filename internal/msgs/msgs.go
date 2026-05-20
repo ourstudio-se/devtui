@@ -29,6 +29,12 @@ type LogLine struct {
 	Timestamp   time.Time
 }
 
+// LogsUpdated is a coalesced wake-up: one or more log buffers were written
+// since the last tick. Carries no payload — the UI reads buffers directly.
+// Used instead of per-line LogLine for service logs to avoid flooding the
+// bubbletea message queue during dotnet/npm startup spew.
+type LogsUpdated struct{}
+
 // ProcessExited is sent when a managed process terminates.
 type ProcessExited struct {
 	ServiceName string

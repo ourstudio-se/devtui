@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -61,8 +62,11 @@ type Manager struct {
 	envVars      map[string]string
 	processes    map[string]*managedProcess
 	logFollowers map[string]context.CancelFunc
+	services     map[string]*Service
 	mu           sync.Mutex
 	program      *tea.Program
+	closing      atomic.Bool
+	logsDirty    atomic.Bool
 }
 
 type managedProcess struct {
@@ -110,9 +114,44 @@ func NewManager(projectRoot, composeFile string) *Manager {
 // SetProgram sets the tea.Program reference for sending messages.
 func (m *Manager) SetProgram(p *tea.Program) {
 	m.program = p
+	go m.runLogTicker()
+}
+
+// RegisterServices builds the name -> *Service index used by sendLog to write
+// directly into log buffers (bypassing the bubbletea message queue).
+func (m *Manager) RegisterServices(services []*Service) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.services == nil {
+		m.services = make(map[string]*Service, len(services))
+	}
+	for _, svc := range services {
+		m.services[svc.Name] = svc
+	}
+}
+
+// runLogTicker coalesces log-buffer writes into a single UI wake-up at a
+// fixed rate. Without this, a process spewing thousands of lines per second
+// floods bubbletea's message queue and stalls the render loop.
+func (m *Manager) runLogTicker() {
+	ticker := time.NewTicker(75 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		if m.closing.Load() {
+			return
+		}
+		if m.logsDirty.Swap(false) {
+			m.send(msgs.LogsUpdated{})
+		}
+	}
 }
 
 func (m *Manager) send(msg tea.Msg) {
+	// Background goroutines (tail, monitorPID, cmd.Wait) outlive the
+	// bubbletea program; sending to a torn-down program can panic.
+	if m.closing.Load() {
+		return
+	}
 	if m.program != nil {
 		m.program.Send(msg)
 	}
@@ -123,6 +162,18 @@ func (m *Manager) sendLog(name, line string) {
 	if strings.TrimSpace(cleaned) == "" {
 		return
 	}
+	m.mu.Lock()
+	svc := m.services[name]
+	m.mu.Unlock()
+	if svc != nil {
+		// Hot path: write straight to the ring buffer and let the ticker
+		// wake the UI. Avoids one bubbletea message per line.
+		svc.LogBuffer.Write(cleaned)
+		m.logsDirty.Store(true)
+		return
+	}
+	// Fallback for unregistered names (e.g. "[build]") — routed through
+	// the model, which writes them into its own buildLog buffer.
 	m.send(msgs.LogLine{ServiceName: name, Line: cleaned, Timestamp: time.Now()})
 }
 
@@ -550,8 +601,8 @@ func (m *Manager) startDotnet(svc *Service) {
 	done := make(chan struct{})
 	m.mu.Lock()
 	m.processes[svc.Name] = &managedProcess{cmd: cmd, cancel: cancel, done: done, logFile: lf}
-	m.saveCurrentState()
 	m.mu.Unlock()
+	m.saveCurrentState()
 
 	m.sendState(svc.Name, msgs.StateRunning, nil)
 
@@ -567,13 +618,17 @@ func (m *Manager) startDotnet(svc *Service) {
 	go m.tailLogFile(logCtx, svc.Name, logPath)
 
 	go func() {
+		// close(done) is the barrier stopProcessByName waits on; defer it so
+		// it fires only after every post-exit side-effect (delete, save,
+		// ProcessExited send) has completed. Closing it earlier lets
+		// StopAllProcesses race to set m.closing and drop the final send.
+		defer close(done)
 		err := cmd.Wait()
 		lf.Close()
-		close(done)
 		m.mu.Lock()
 		delete(m.processes, svc.Name)
-		m.removeServiceFromState(svc.Name)
 		m.mu.Unlock()
+		m.saveCurrentState()
 
 		// Cancel log tailer
 		m.mu.Lock()
@@ -661,8 +716,8 @@ func (m *Manager) startNPM(svc *Service) {
 	done := make(chan struct{})
 	m.mu.Lock()
 	m.processes[svc.Name] = &managedProcess{cmd: cmd, cancel: cancel, done: done, logFile: lf}
-	m.saveCurrentState()
 	m.mu.Unlock()
+	m.saveCurrentState()
 
 	m.sendState(svc.Name, msgs.StateRunning, nil)
 
@@ -671,13 +726,14 @@ func (m *Manager) startNPM(svc *Service) {
 	}
 
 	go func() {
+		// See startDotnet for the rationale on deferring close(done).
+		defer close(done)
 		err := cmd.Wait()
 		lf.Close()
-		close(done)
 		m.mu.Lock()
 		delete(m.processes, svc.Name)
-		m.removeServiceFromState(svc.Name)
 		m.mu.Unlock()
+		m.saveCurrentState()
 
 		// Cancel log tailer
 		m.mu.Lock()
@@ -700,12 +756,16 @@ func (m *Manager) startNPM(svc *Service) {
 // --- Process control ---
 
 func (m *Manager) stopProcess(svc *Service) {
+	m.stopProcessByName(svc.Name)
+}
+
+func (m *Manager) stopProcessByName(name string) {
 	m.mu.Lock()
-	proc, ok := m.processes[svc.Name]
+	proc, ok := m.processes[name]
 	m.mu.Unlock()
 
 	if !ok {
-		m.sendState(svc.Name, msgs.StateStopped, nil)
+		m.sendState(name, msgs.StateStopped, nil)
 		return
 	}
 
@@ -723,15 +783,52 @@ func (m *Manager) stopProcess(svc *Service) {
 		<-proc.done
 	}
 
-	// Cancel log tailer
 	m.mu.Lock()
-	if cancel, ok := m.logFollowers[svc.Name]; ok {
+	if cancel, ok := m.logFollowers[name]; ok {
 		cancel()
-		delete(m.logFollowers, svc.Name)
+		delete(m.logFollowers, name)
 	}
 	m.mu.Unlock()
 
-	m.sendState(svc.Name, msgs.StateStopped, nil)
+	m.sendState(name, msgs.StateStopped, nil)
+}
+
+// StopAllProcesses synchronously stops every tracked non-docker child and
+// waits for each to exit. Required on shutdown because children were started
+// with Setpgid:true — if the parent exits first they get reparented to PID 1
+// and survive as orphans. Safe to call from signal handlers; idempotent.
+func (m *Manager) StopAllProcesses() {
+	m.mu.Lock()
+	names := make([]string, 0, len(m.processes))
+	for name := range m.processes {
+		names = append(names, name)
+	}
+	m.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for _, name := range names {
+		wg.Add(1)
+		go func(n string) {
+			defer wg.Done()
+			m.stopProcessByName(n)
+		}(name)
+	}
+	wg.Wait()
+
+	// Cancel any remaining log followers (e.g. docker `logs -f` subprocesses)
+	// so their child processes don't leak past devtui exit.
+	m.mu.Lock()
+	for name, cancel := range m.logFollowers {
+		cancel()
+		delete(m.logFollowers, name)
+	}
+	m.mu.Unlock()
+
+	SaveState(m.projectRoot, &StateFile{})
+
+	// After this point, straggler goroutines that call send() are dropped
+	// rather than racing the torn-down tea.Program.
+	m.closing.Store(true)
 }
 
 // --- Utility ---
@@ -1134,10 +1231,7 @@ func (m *Manager) adoptRunningServices(services []*Service) {
 	}
 
 	if changed {
-		// Re-save state with stale entries removed
-		m.mu.Lock()
 		m.saveCurrentState()
-		m.mu.Unlock()
 	}
 }
 
@@ -1151,11 +1245,10 @@ func (m *Manager) monitorPID(svc *Service, pid int, done chan struct{}) {
 			return
 		case <-ticker.C:
 			if err := syscall.Kill(pid, 0); err != nil {
-				close(done)
 				m.mu.Lock()
 				delete(m.processes, svc.Name)
 				m.mu.Unlock()
-				m.removeServiceFromState(svc.Name)
+				m.saveCurrentState()
 
 				// Cancel log tailer
 				m.mu.Lock()
@@ -1166,6 +1259,9 @@ func (m *Manager) monitorPID(svc *Service, pid int, done chan struct{}) {
 				m.mu.Unlock()
 
 				m.send(msgs.ProcessExited{ServiceName: svc.Name, ExitCode: -1, Error: nil})
+				// close(done) last so stopProcessByName only unblocks after
+				// ProcessExited is delivered.
+				close(done)
 				return
 			}
 		}
