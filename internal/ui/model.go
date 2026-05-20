@@ -76,6 +76,7 @@ func NewModel(cfg *config.Config) Model {
 	}
 
 	mgr := service.NewManager(cfg.ProjectRoot, cfg.ComposeFile)
+	mgr.RegisterServices(services)
 
 	return Model{
 		services:   services,
@@ -90,6 +91,12 @@ func NewModel(cfg *config.Config) Model {
 // SetProgram passes the tea.Program to the manager for async message sending.
 func (m Model) SetProgram(p *tea.Program) {
 	m.manager.SetProgram(p)
+}
+
+// Manager returns the service manager so callers (e.g. main's signal handler)
+// can drive shutdown independently of the bubbletea event loop.
+func (m Model) Manager() *service.Manager {
+	return m.manager
 }
 
 func (m Model) Init() tea.Cmd {
@@ -181,7 +188,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.Quit):
 			m.quitting = true
 			m.hardQuit = true
-			return m, tea.Batch(m.manager.StopAll(m.services), func() tea.Msg { return tea.Quit() })
+			// Block until children are reaped before issuing Quit.
+			// tea.Batch would race the two commands and Quit usually wins,
+			// leaving services orphaned in their own process groups.
+			mgr := m.manager
+			return m, func() tea.Msg {
+				mgr.StopAllProcesses()
+				return tea.Quit()
+			}
 
 		case key.Matches(msg, m.keys.Help):
 			m.showHelp = !m.showHelp
@@ -344,16 +358,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case msgs.LogLine:
+		// Registered services write directly to their buffer via the
+		// manager's fast path; LogLine now only carries unregistered
+		// names like "[build]".
 		if msg.ServiceName == "[build]" {
 			m.buildLog.Write(msg.Line)
-		} else {
-			for _, svc := range m.services {
-				if svc.Name == msg.ServiceName {
-					svc.LogBuffer.Write(msg.Line)
-					break
-				}
-			}
 		}
+		return m, nil
+
+	case msgs.LogsUpdated:
+		// Coalesced wake-up — buffers are already written. Returning
+		// triggers a re-render against the current buffer state.
 		return m, nil
 
 	case msgs.ProcessExited:
